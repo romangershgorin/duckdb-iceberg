@@ -49,13 +49,13 @@ jobs:
           ENABLE_EXTENSION_AUTOLOADING: 1
           ENABLE_EXTENSION_AUTOINSTALL: 1
         run: |
-          make release
+          make debug
 
-      - name: Upload DuckDB-Iceberg release folder
+      - name: Upload DuckDB-Iceberg debug folder
         uses: actions/upload-artifact@v4
         with:
           name: duckdb-iceberg
-          path: build/release/
+          path: build/debug/
           retention-days: 3
 
   test-fixture:
