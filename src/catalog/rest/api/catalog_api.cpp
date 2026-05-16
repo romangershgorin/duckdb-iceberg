@@ -17,6 +17,7 @@
 #include "catalog/rest/storage/iceberg_authorization.hpp"
 
 #include <sys/stat.h>
+#include <fstream>
 
 #include "rest_catalog/objects/list.hpp"
 #include "rest_catalog/objects/iceberg_error_response.hpp"
@@ -201,12 +202,25 @@ IRCAPITableLocation IRCAPI::GetTableLocation(ClientContext &context, IcebergCata
 	// Request minimal snapshot info to keep the response small and avoid Glue's ~5MB response limit
 	url_builder.SetParam("snapshots", IRCPathComponent::RegularComponent("refs"));
 
+	auto log_url = url_builder.GetURLEncoded();
+	{
+		std::ofstream log("/home/duckdbuser/log.txt", std::ios::app);
+		log << "[GetTableLocation] GET " << log_url << "\n";
+	}
+
 	HTTPHeaders headers(*context.db);
 	if (catalog.attach_options.access_mode == IRCAccessDelegationMode::VENDED_CREDENTIALS) {
 		headers.Insert("X-Iceberg-Access-Delegation", "vended-credentials");
 	}
 	auto result = catalog.auth_handler->Request(RequestType::GET_REQUEST, context, url_builder, headers);
+	{
+		std::ofstream log("/home/duckdbuser/log.txt", std::ios::app);
+		log << "[GetTableLocation] response status=" << static_cast<int>(result->status)
+		    << " body_size=" << result->body.size() << "\n";
+	}
 	if (result->status != HTTPStatusCode::OK_200) {
+		std::ofstream log("/home/duckdbuser/log.txt", std::ios::app);
+		log << "[GetTableLocation] ERROR body=" << result->body << "\n";
 		ThrowException(url_builder.GetURLEncoded(), *result, result->reason);
 	}
 
@@ -217,6 +231,10 @@ IRCAPITableLocation IRCAPI::GetTableLocation(ClientContext &context, IcebergCata
 	auto *ml_val = yyjson_obj_get(root, "metadata-location");
 	if (ml_val && yyjson_is_str(ml_val)) {
 		loc.metadata_location = yyjson_get_str(ml_val);
+	}
+	{
+		std::ofstream log("/home/duckdbuser/log.txt", std::ios::app);
+		log << "[GetTableLocation] metadata-location=" << loc.metadata_location << "\n";
 	}
 	if (loc.metadata_location.empty()) {
 		throw InvalidConfigurationException(
@@ -248,6 +266,12 @@ IRCAPITableLocation IRCAPI::GetTableLocation(ClientContext &context, IcebergCata
 			}
 			loc.storage_credentials.emplace_back(std::move(cred));
 		}
+	}
+	{
+		std::ofstream log("/home/duckdbuser/log.txt", std::ios::app);
+		log << "[GetTableLocation] has_config=" << loc.has_config
+		    << " has_storage_credentials=" << loc.has_storage_credentials
+		    << " num_credentials=" << loc.storage_credentials.size() << "\n";
 	}
 	return loc;
 }

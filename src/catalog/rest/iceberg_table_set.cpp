@@ -21,6 +21,7 @@
 #include "catalog/rest/storage/authorization/oauth2.hpp"
 #include "catalog/rest/catalog_entry/iceberg_schema_entry.hpp"
 #include "core/metadata/partition/iceberg_partition_spec.hpp"
+#include <fstream>
 
 namespace duckdb {
 
@@ -61,6 +62,10 @@ bool IcebergTableSet::FillEntry(ClientContext &context, IcebergTableInformation 
 
 	// Glue two-step: lightweight REST call to get metadata-location, then read from S3
 	if (ic_catalog.attach_options.endpoint_type == IcebergEndpointType::AWS_GLUE) {
+		{
+			std::ofstream log("/home/duckdbuser/log.txt", std::ios::app);
+			log << "[FillEntry] Glue two-step: table=" << table.name << "\n";
+		}
 		auto table_location = IRCAPI::GetTableLocation(context, ic_catalog, schema, table.name);
 
 		// Build a partial LoadTableResult for the credential cache — no inline metadata
@@ -74,10 +79,19 @@ bool IcebergTableSet::FillEntry(ClientContext &context, IcebergTableInformation 
 		ic_catalog.StoreLoadTableResult(table_key, std::move(partial_result));
 
 		// Read the full metadata.json from S3 via httpfs
+		{
+			std::ofstream log("/home/duckdbuser/log.txt", std::ios::app);
+			log << "[FillEntry] reading metadata from S3: " << table_location.metadata_location << "\n";
+		}
 		auto &fs = FileSystem::GetFileSystem(context);
 		auto rest_metadata = IcebergTableMetadata::Parse(table_location.metadata_location, fs, "");
 		table.table_metadata = IcebergTableMetadata::FromTableMetadata(rest_metadata);
 		table.table_metadata.latest_metadata_json = table_location.metadata_location;
+		{
+			std::ofstream log("/home/duckdbuser/log.txt", std::ios::app);
+			log << "[FillEntry] S3 read done, schemas=" << table.table_metadata.schemas.size()
+			    << " snapshots=" << table.table_metadata.snapshots.size() << "\n";
+		}
 
 		auto &schemas = table.table_metadata.schemas;
 		D_ASSERT(!schemas.empty());
