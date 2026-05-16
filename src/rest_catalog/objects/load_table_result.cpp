@@ -34,6 +34,7 @@ string LoadTableResult::TryFromJSON(yyjson_val *obj) {
 		if (!error.empty()) {
 			return error;
 		}
+		has_metadata = true;
 	}
 	auto metadata_location_val = yyjson_obj_get(obj, "metadata-location");
 	if (metadata_location_val) {

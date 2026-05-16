@@ -530,8 +530,13 @@ IcebergTableInformation IcebergTableInformation::Copy() const {
 		auto cached_result = catalog.TryGetValidCachedLoadTableResult(table_key, cache_lock, false);
 		D_ASSERT(cached_result);
 		auto &cached_table_result = *cached_result->load_table_result;
-		ret.table_metadata = IcebergTableMetadata::FromTableMetadata(cached_table_result.metadata);
-		ret.table_metadata.latest_metadata_json = cached_table_result.metadata_location;
+		if (!cached_table_result.has_metadata) {
+			// Glue two-step: metadata was read from S3 into this object, not stored inline in cache
+			ret.table_metadata = table_metadata;
+		} else {
+			ret.table_metadata = IcebergTableMetadata::FromTableMetadata(cached_table_result.metadata);
+			ret.table_metadata.latest_metadata_json = cached_table_result.metadata_location;
+		}
 	}
 	return ret;
 }

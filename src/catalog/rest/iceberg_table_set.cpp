@@ -40,8 +40,16 @@ bool IcebergTableSet::FillEntry(ClientContext &context, IcebergTableInformation 
 		lock_guard<std::mutex> cache_lock(ic_catalog.GetMetadataCacheLock());
 		auto cached_result = ic_catalog.TryGetValidCachedLoadTableResult(table_key, cache_lock);
 		if (cached_result) {
-			// Use the cached result instead of making a new request
-			table.table_metadata = IcebergTableMetadata::FromLoadTableResult(*cached_result->load_table_result);
+			auto &ltr = *cached_result->load_table_result;
+			if (!ltr.has_metadata) {
+				// Glue two-step: cached entry has credentials but no inline metadata — re-read from S3
+				auto &fs = FileSystem::GetFileSystem(context);
+				auto rest_metadata = IcebergTableMetadata::Parse(ltr.metadata_location, fs, "");
+				table.table_metadata = IcebergTableMetadata::FromTableMetadata(rest_metadata);
+				table.table_metadata.latest_metadata_json = ltr.metadata_location;
+			} else {
+				table.table_metadata = IcebergTableMetadata::FromLoadTableResult(ltr);
+			}
 			auto &schemas = table.table_metadata.schemas;
 			D_ASSERT(!schemas.empty());
 			for (auto &table_schema : schemas) {
@@ -49,6 +57,34 @@ bool IcebergTableSet::FillEntry(ClientContext &context, IcebergTableInformation 
 			}
 			return true;
 		}
+	}
+
+	// Glue two-step: lightweight REST call to get metadata-location, then read from S3
+	if (ic_catalog.attach_options.endpoint_type == IcebergEndpointType::AWS_GLUE) {
+		auto table_location = IRCAPI::GetTableLocation(context, ic_catalog, schema, table.name);
+
+		// Build a partial LoadTableResult for the credential cache — no inline metadata
+		auto partial_result = make_uniq<rest_api_objects::LoadTableResult>();
+		partial_result->metadata_location = table_location.metadata_location;
+		partial_result->has_metadata_location = true;
+		partial_result->config = table_location.config;
+		partial_result->has_config = table_location.has_config;
+		partial_result->storage_credentials = std::move(table_location.storage_credentials);
+		partial_result->has_storage_credentials = table_location.has_storage_credentials;
+		ic_catalog.StoreLoadTableResult(table_key, std::move(partial_result));
+
+		// Read the full metadata.json from S3 via httpfs
+		auto &fs = FileSystem::GetFileSystem(context);
+		auto rest_metadata = IcebergTableMetadata::Parse(table_location.metadata_location, fs, "");
+		table.table_metadata = IcebergTableMetadata::FromTableMetadata(rest_metadata);
+		table.table_metadata.latest_metadata_json = table_location.metadata_location;
+
+		auto &schemas = table.table_metadata.schemas;
+		D_ASSERT(!schemas.empty());
+		for (auto &table_schema : schemas) {
+			table.CreateSchemaVersion(*table_schema.second);
+		}
+		return true;
 	}
 
 	// No valid cached result or caching disabled, make a new request

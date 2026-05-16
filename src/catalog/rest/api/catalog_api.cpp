@@ -20,6 +20,7 @@
 
 #include "rest_catalog/objects/list.hpp"
 #include "rest_catalog/objects/iceberg_error_response.hpp"
+#include "rest_catalog/objects/storage_credential.hpp"
 
 using namespace duckdb_yyjson;
 namespace duckdb {
@@ -187,6 +188,68 @@ APIResult<unique_ptr<const rest_api_objects::LoadTableResult>> IRCAPI::GetTable(
 	ret.result_ =
 	    make_uniq<const rest_api_objects::LoadTableResult>(rest_api_objects::LoadTableResult::FromJSON(metadata_root));
 	return ret;
+}
+
+IRCAPITableLocation IRCAPI::GetTableLocation(ClientContext &context, IcebergCatalog &catalog,
+                                             const IcebergSchemaEntry &schema, const string &table_name) {
+	auto url_builder = catalog.GetBaseUrl();
+	url_builder.AddPrefixComponent(catalog.prefix, catalog.prefix_is_one_component);
+	url_builder.AddPathComponent(IRCPathComponent::RegularComponent("namespaces"));
+	url_builder.AddPathComponent(IRCPathComponent::NamespaceComponent(schema.namespace_items));
+	url_builder.AddPathComponent(IRCPathComponent::RegularComponent("tables"));
+	url_builder.AddPathComponent(IRCPathComponent::RegularComponent(table_name));
+	// Request minimal snapshot info to keep the response small and avoid Glue's ~5MB response limit
+	url_builder.SetParam("snapshots", IRCPathComponent::RegularComponent("refs"));
+
+	HTTPHeaders headers(*context.db);
+	if (catalog.attach_options.access_mode == IRCAccessDelegationMode::VENDED_CREDENTIALS) {
+		headers.Insert("X-Iceberg-Access-Delegation", "vended-credentials");
+	}
+	auto result = catalog.auth_handler->Request(RequestType::GET_REQUEST, context, url_builder, headers);
+	if (result->status != HTTPStatusCode::OK_200) {
+		ThrowException(url_builder.GetURLEncoded(), *result, result->reason);
+	}
+
+	std::unique_ptr<yyjson_doc, YyjsonDocDeleter> doc(ICUtils::api_result_to_doc(result->body));
+	auto *root = yyjson_doc_get_root(doc.get());
+
+	IRCAPITableLocation loc;
+	auto *ml_val = yyjson_obj_get(root, "metadata-location");
+	if (ml_val && yyjson_is_str(ml_val)) {
+		loc.metadata_location = yyjson_get_str(ml_val);
+	}
+	if (loc.metadata_location.empty()) {
+		throw InvalidConfigurationException(
+		    "Glue REST response did not include a 'metadata-location' field for table '%s'", table_name);
+	}
+
+	auto *config_val = yyjson_obj_get(root, "config");
+	if (config_val && yyjson_is_obj(config_val)) {
+		loc.has_config = true;
+		size_t idx, max;
+		yyjson_val *key, *val;
+		yyjson_obj_foreach(config_val, idx, max, key, val) {
+			if (yyjson_is_str(val)) {
+				loc.config.emplace(yyjson_get_str(key), yyjson_get_str(val));
+			}
+		}
+	}
+
+	auto *creds_val = yyjson_obj_get(root, "storage-credentials");
+	if (creds_val && yyjson_is_arr(creds_val)) {
+		loc.has_storage_credentials = true;
+		size_t idx, max;
+		yyjson_val *val;
+		yyjson_arr_foreach(creds_val, idx, max, val) {
+			rest_api_objects::StorageCredential cred;
+			auto err = cred.TryFromJSON(val);
+			if (!err.empty()) {
+				throw InvalidInputException("Failed to parse storage credential: %s", err);
+			}
+			loc.storage_credentials.emplace_back(std::move(cred));
+		}
+	}
+	return loc;
 }
 
 vector<rest_api_objects::TableIdentifier> IRCAPI::GetTables(ClientContext &context, IcebergCatalog &catalog,

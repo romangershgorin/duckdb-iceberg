@@ -37,6 +37,16 @@ public:
 	rest_api_objects::IcebergErrorResponse error_;
 };
 
+//! Lightweight result for the Glue two-step metadata fetch — contains only
+//! the fields needed to locate the metadata file and set up storage credentials.
+struct IRCAPITableLocation {
+	string metadata_location;
+	case_insensitive_map_t<string> config;
+	bool has_config = false;
+	vector<rest_api_objects::StorageCredential> storage_credentials;
+	bool has_storage_credentials = false;
+};
+
 class IRCAPI {
 public:
 	static const string API_VERSION_1;
@@ -52,6 +62,9 @@ public:
 	                                                                               IcebergCatalog &catalog,
 	                                                                               const IcebergSchemaEntry &schema,
 	                                                                               const string &table_name);
+	//! Glue two-step: fetch only metadata-location + credentials without inline metadata
+	static IRCAPITableLocation GetTableLocation(ClientContext &context, IcebergCatalog &catalog,
+	                                            const IcebergSchemaEntry &schema, const string &table_name);
 	static vector<IRCAPISchema> GetSchemas(ClientContext &context, IcebergCatalog &catalog,
 	                                       const vector<string> &parent);
 	static void CommitTableUpdate(ClientContext &context, IcebergCatalog &catalog, const vector<string> &schema,

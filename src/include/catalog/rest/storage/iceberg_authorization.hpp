@@ -33,6 +33,7 @@ struct IcebergAttachOptions {
 	unordered_map<string, Value> options;
 	// max staleness for cached table metadata in minutes (optional - if not set, always request fresh metadata)
 	optional_idx max_table_staleness_micros;
+	IcebergEndpointType endpoint_type = IcebergEndpointType::INVALID;
 };
 
 //! Hold the pre-initialized HTTPClient for a given connection

@@ -629,6 +629,7 @@ unique_ptr<Catalog> IcebergCatalog::Attach(optional_ptr<StorageExtensionInfo> st
 		case IcebergEndpointType::AWS_GLUE: {
 			GlueAttach(context, attach_options);
 			endpoint_type = IcebergEndpointType::AWS_GLUE;
+			attach_options.endpoint_type = IcebergEndpointType::AWS_GLUE;
 			SetAWSCatalogOptions(attach_options, set_by_attach_options);
 			break;
 		}

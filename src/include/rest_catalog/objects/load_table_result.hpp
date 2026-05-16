@@ -29,6 +29,7 @@ public:
 
 public:
 	TableMetadata metadata;
+	bool has_metadata = false;
 	string metadata_location;
 	bool has_metadata_location = false;
 	case_insensitive_map_t<string> config;
