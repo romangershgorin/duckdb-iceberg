@@ -469,6 +469,10 @@ bool IcebergMultiFileReader::ParseOption(const string &key, const Value &val, Mu
 		this->options.version_name_format = value;
 		return true;
 	}
+	if (loption == "start_snapshot_id") {
+		this->options.start_snapshot_id = val.GetValue<int64_t>();
+		return true;
+	}
 	if (loption == "snapshot_from_id") {
 		if (snapshot_lookup->GetSource() != SnapshotSource::LATEST) {
 			throw InvalidInputException("Can't use 'snapshot_from_id' in combination with 'snapshot_from_timestamp'");

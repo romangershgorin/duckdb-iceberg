@@ -46,6 +46,12 @@ public:
 	string version_name_format = DEFAULT_TABLE_VERSION_FORMAT;
 
 	optional<IcebergSnapshotLookup> snapshot_lookup;
+
+	// When set, the scan returns only data files whose manifest sequence_number
+	// is greater than the start snapshot's sequence_number — i.e. files added
+	// after start_snapshot_id.  Must be used together with snapshot_lookup
+	// pointing at the end snapshot.
+	optional<int64_t> start_snapshot_id;
 };
 
 } // namespace duckdb

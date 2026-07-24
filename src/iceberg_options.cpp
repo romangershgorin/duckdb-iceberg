@@ -27,6 +27,8 @@ IcebergOptions::IcebergOptions(named_parameter_map_t &named_parameters) : Iceber
 				    string_substitutions);
 			}
 			version_name_format = value;
+		} else if (loption == "start_snapshot_id") {
+			start_snapshot_id = val.GetValue<int64_t>();
 		} else if (loption == "snapshot_from_id") {
 			if (snapshot_lookup) {
 				throw InvalidInputException(
@@ -56,6 +58,7 @@ IcebergOptions &IcebergOptions::operator=(const IcebergOptions &other) {
 	infer_schema = other.infer_schema;
 	table_version = other.table_version;
 	version_name_format = other.version_name_format;
+	start_snapshot_id = other.start_snapshot_id;
 	snapshot_lookup.reset();
 	if (other.snapshot_lookup) {
 		snapshot_lookup.emplace(*other.snapshot_lookup);

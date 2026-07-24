@@ -1336,8 +1336,30 @@ void IcebergMultiFileList::LoadManifestList(lock_guard<mutex> &guard) const {
 			}
 		}
 
+		// Resolve incremental start sequence number once (if start_snapshot_id is set)
+		optional<sequence_number_t> start_seq;
+		if (options.start_snapshot_id) {
+			auto start_snap = metadata.GetSnapshotById(*options.start_snapshot_id);
+			if (!start_snap) {
+				throw InvalidInputException("start_snapshot_id %lld not found in table metadata",
+				                            *options.start_snapshot_id);
+			}
+			if (!start_snap->sequence_number) {
+				throw InvalidInputException("start_snapshot_id %lld has no sequence number",
+				                            *options.start_snapshot_id);
+			}
+			start_seq = *start_snap->sequence_number;
+		}
+
 		for (auto &manifest_list_entry : manifest_list_entries) {
 			auto &manifest_file = manifest_list_entry.file;
+
+			// Incremental scan: skip manifests whose every file pre-dates start_snapshot_id
+			if (start_seq && manifest_file.sequence_number &&
+			    *manifest_file.sequence_number <= *start_seq) {
+				continue;
+			}
+
 			if (manifest_file.content == IcebergManifestContentType::DATA) {
 				shared_state->committed_data_manifests.push_back(std::move(manifest_list_entry));
 			} else {
