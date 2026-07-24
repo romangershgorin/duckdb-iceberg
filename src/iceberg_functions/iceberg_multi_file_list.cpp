@@ -629,6 +629,15 @@ optional_ptr<const IcebergManifestEntry> IcebergMultiFileList::GetDataFile(idx_t
 			auto &manifest_entry = current_manifest_entries[manifest_entry_idx];
 			auto &data_file = manifest_entry.data_file;
 			manifest_entry_idx++;
+
+			// Incremental scan: skip data files added at or before start_snapshot_id. The entry's
+			// sequence_number is the file's data sequence number (preserved across manifest
+			// rewrites/compaction), so this correctly returns only files added after the start
+			// snapshot even when old and new files share a compacted manifest.
+			if (has_incremental_start_seq && manifest_entry.sequence_number <= incremental_start_seq) {
+				continue;
+			}
+
 			// Check whether current data file is filtered out.
 			if (!table_filters.filters.empty() && !FileMatchesFilter(manifest_entry, IcebergDataFileType::DATA)) {
 				DUCKDB_LOG(context, IcebergLogType, "Iceberg Filter Pushdown, skipped 'data_file': '%s'",
@@ -822,17 +831,19 @@ void IcebergMultiFileList::InitializeFiles(lock_guard<mutex> &guard) const {
 			}
 		}
 
-		// Resolve incremental start sequence number once (if start_snapshot_id is set)
-		bool has_start_seq = false;
-		sequence_number_t start_seq = 0;
+		// Resolve incremental start sequence number once (if start_snapshot_id is set).
+		// Stored on the file list so GetDataFile() can filter individual data files: a manifest
+		// rewrite/compaction assigns a carried-forward manifest a NEW (high) sequence_number while
+		// its entries keep their original (low) sequence_number, so old data can hide inside a
+		// manifest whose own sequence_number is > start. File-level filtering handles that.
 		if (options.has_start_snapshot_id) {
 			auto start_snap = metadata.GetSnapshotById(options.start_snapshot_id);
 			if (!start_snap) {
 				throw InvalidInputException("start_snapshot_id %d not found in table metadata",
 				                            options.start_snapshot_id);
 			}
-			start_seq = start_snap->sequence_number;
-			has_start_seq = true;
+			incremental_start_seq = start_snap->sequence_number;
+			has_incremental_start_seq = true;
 		}
 
 		for (auto &manifest_list_entry : manifest_list_entries) {
@@ -844,8 +855,11 @@ void IcebergMultiFileList::InitializeFiles(lock_guard<mutex> &guard) const {
 				continue;
 			}
 
-			// Incremental scan: skip manifests added at or before start_snapshot_id
-			if (has_start_seq && manifest_file.sequence_number <= start_seq) {
+			// Incremental scan (optimization only): skip a manifest whose own sequence_number is
+			// already <= start -- every entry in it is provably old. Manifests that survive here
+			// are still filtered per data file in GetDataFile(), which is what correctly handles
+			// compacted manifests that mix old and new entries.
+			if (has_incremental_start_seq && manifest_file.sequence_number <= incremental_start_seq) {
 				continue;
 			}
 

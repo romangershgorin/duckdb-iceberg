@@ -165,6 +165,16 @@ public:
 	mutable unordered_map<int32_t, column_t> equality_id_to_result_id;
 
 	mutable bool initialized = false;
+
+	//! Incremental scan: resolved sequence_number of options.start_snapshot_id.
+	//! Data files whose sequence_number <= incremental_start_seq were added at or before the
+	//! start snapshot and are excluded. Resolved once in LoadManifestList, applied per-file in
+	//! GetDataFile (manifest-level filtering alone is wrong after a manifest rewrite/compaction,
+	//! which bumps a carried-forward manifest's sequence_number while its entries keep the
+	//! original one).
+	mutable bool has_incremental_start_seq = false;
+	mutable sequence_number_t incremental_start_seq = 0;
+
 	const IcebergOptions &options;
 };
 
