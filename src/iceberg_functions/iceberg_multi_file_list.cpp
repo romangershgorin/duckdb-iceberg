@@ -822,12 +822,30 @@ void IcebergMultiFileList::InitializeFiles(lock_guard<mutex> &guard) const {
 			}
 		}
 
+		// Resolve incremental start sequence number once (if start_snapshot_id is set)
+		bool has_start_seq = false;
+		sequence_number_t start_seq = 0;
+		if (options.has_start_snapshot_id) {
+			auto start_snap = metadata.GetSnapshotById(options.start_snapshot_id);
+			if (!start_snap) {
+				throw InvalidInputException("start_snapshot_id %d not found in table metadata",
+				                            options.start_snapshot_id);
+			}
+			start_seq = start_snap->sequence_number;
+			has_start_seq = true;
+		}
+
 		for (auto &manifest_list_entry : manifest_list_entries) {
 			auto &manifest_file = manifest_list_entry.file;
 			if (!ManifestMatchesFilter(manifest_file)) {
 				DUCKDB_LOG(context, IcebergLogType, "Iceberg Filter Pushdown, skipped 'manifest_file': '%s'",
 				           manifest_file.manifest_path);
 				//! Skip this manifest
+				continue;
+			}
+
+			// Incremental scan: skip manifests added at or before start_snapshot_id
+			if (has_start_seq && manifest_file.sequence_number <= start_seq) {
 				continue;
 			}
 

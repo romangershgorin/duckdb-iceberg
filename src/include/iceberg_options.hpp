@@ -48,6 +48,13 @@ struct IcebergOptions {
 	string version_name_format = DEFAULT_TABLE_VERSION_FORMAT;
 
 	IcebergSnapshotLookup snapshot_lookup;
+
+	// Incremental scan: when has_start_snapshot_id is set, the scan returns only
+	// data files whose manifest sequence_number is greater than the start
+	// snapshot's sequence_number — i.e. files added after start_snapshot_id.
+	// Meant to be used together with snapshot_from_id pointing at the end snapshot.
+	bool has_start_snapshot_id = false;
+	int64_t start_snapshot_id = 0;
 };
 
 } // namespace duckdb
