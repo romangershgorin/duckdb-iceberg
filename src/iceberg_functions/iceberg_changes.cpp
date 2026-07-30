@@ -13,9 +13,8 @@ namespace duckdb {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 static vector<IcebergManifestListEntry> LoadManifestList(const IcebergSnapshot &snapshot,
-                                                          const IcebergTableMetadata &metadata,
-                                                          ClientContext &context, const string &iceberg_path,
-                                                          const IcebergOptions &options) {
+                                                         const IcebergTableMetadata &metadata, ClientContext &context,
+                                                         const string &iceberg_path, const IcebergOptions &options) {
 	auto &fs = FileSystem::GetFileSystem(context);
 	auto manifest_list_path = options.allow_moved_paths
 	                              ? IcebergUtils::GetFullPath(iceberg_path, snapshot.manifest_list, fs)
@@ -30,9 +29,9 @@ static vector<IcebergManifestListEntry> LoadManifestList(const IcebergSnapshot &
 }
 
 static unordered_set<string> CollectDataFilePaths(const IcebergSnapshot &snapshot,
-                                                   const vector<IcebergManifestListEntry> &manifest_list,
-                                                   const IcebergTableMetadata &metadata, ClientContext &context,
-                                                   const string &iceberg_path, const IcebergOptions &options) {
+                                                  const vector<IcebergManifestListEntry> &manifest_list,
+                                                  const IcebergTableMetadata &metadata, ClientContext &context,
+                                                  const string &iceberg_path, const IcebergOptions &options) {
 	auto &fs = FileSystem::GetFileSystem(context);
 	vector<IcebergManifestListEntry> data_manifests;
 	for (auto &m : manifest_list) {
@@ -76,8 +75,7 @@ struct IcebergChangesGlobalState : public GlobalTableFunctionState {
 	unique_ptr<DataChunk> held_chunk; // keeps fetched parquet chunk alive across Scan calls
 	bool done = false;
 
-	explicit IcebergChangesGlobalState(ClientContext &context, const IcebergChangesBindData &bind)
-	    : files(bind.files) {
+	explicit IcebergChangesGlobalState(ClientContext &context, const IcebergChangesBindData &bind) : files(bind.files) {
 		auto &db = DatabaseInstance::GetDatabase(context);
 		conn = make_uniq<Connection>(db);
 	}
@@ -102,7 +100,7 @@ struct IcebergChangesGlobalState : public GlobalTableFunctionState {
 // ── Bind ──────────────────────────────────────────────────────────────────────
 
 static unique_ptr<FunctionData> IcebergChangesBind(ClientContext &context, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                                   vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<IcebergChangesBindData>();
 
 	for (auto &kv : input.named_parameters) {
@@ -131,8 +129,7 @@ static unique_ptr<FunctionData> IcebergChangesBind(ClientContext &context, Table
 	auto snap_before_ptr = metadata.GetSnapshotById(snap_before_id);
 	auto snap_after_ptr = metadata.GetSnapshotById(snap_after_id);
 	if (!snap_before_ptr) {
-		throw InvalidInputException("iceberg_changes: snap_before_id %lld not found in table metadata",
-		                            snap_before_id);
+		throw InvalidInputException("iceberg_changes: snap_before_id %lld not found in table metadata", snap_before_id);
 	}
 	if (!snap_after_ptr) {
 		throw InvalidInputException("iceberg_changes: snap_after_id %lld not found in table metadata", snap_after_id);
@@ -188,7 +185,7 @@ static unique_ptr<FunctionData> IcebergChangesBind(ClientContext &context, Table
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 static unique_ptr<GlobalTableFunctionState> IcebergChangesInitGlobal(ClientContext &context,
-                                                                       TableFunctionInitInput &input) {
+                                                                     TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<IcebergChangesBindData>();
 	auto state = make_uniq<IcebergChangesGlobalState>(context, bind);
 	if (!bind.files.empty()) {
@@ -250,8 +247,8 @@ static void IcebergChangesScan(ClientContext &context, TableFunctionInput &data_
 
 TableFunctionSet IcebergFunctions::GetIcebergChangesFunction() {
 	TableFunctionSet function_set("iceberg_changes");
-	TableFunction table_function({LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
-	                             IcebergChangesScan, IcebergChangesBind, IcebergChangesInitGlobal);
+	TableFunction table_function({LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT}, IcebergChangesScan,
+	                             IcebergChangesBind, IcebergChangesInitGlobal);
 	table_function.named_parameters["allow_moved_paths"] = LogicalType::BOOLEAN;
 	table_function.named_parameters["metadata_compression_codec"] = LogicalType::VARCHAR;
 	function_set.AddFunction(table_function);
