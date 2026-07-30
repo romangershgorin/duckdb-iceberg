@@ -60,8 +60,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("iceberg_test_force_token_expiry",
 	                          "DEBUG SETTING: force OAuth2 token expiry for testing automatic refresh",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption("iceberg_start_snapshot_id",
+							  "Incremental scan lower bound (exclusive) for attached Iceberg catalog tables: return only data files added after this snapshot id. -1 disables.",
+							  LogicalType::BIGINT, Value::BIGINT(-1));
 
-	// Iceberg Table Functions
+		// Iceberg Table Functions
 	for (auto &fun : IcebergFunctions::GetTableFunctions(loader)) {
 		loader.RegisterFunction(std::move(fun));
 	}

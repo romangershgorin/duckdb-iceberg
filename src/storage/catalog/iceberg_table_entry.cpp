@@ -169,6 +169,12 @@ TableFunction IcebergTableEntry::GetScanFunction(ClientContext &context, unique_
 	auto storage_location = table_info.table_metadata.location;
 
 	named_parameter_map_t param_map;
+	Value start_snap_val;
+	if (context.TryGetCurrentSetting("iceberg_start_snapshot_id", start_snap_val) &&
+		!start_snap_val.IsNull() && start_snap_val.GetValue<int64_t>() >= 0) {
+		param_map["start_snapshot_id"] = Value::BIGINT(start_snap_val.GetValue<int64_t>());
+	}
+
 	vector<LogicalType> return_types;
 	vector<string> names;
 	TableFunctionRef empty_ref;
