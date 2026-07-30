@@ -56,45 +56,29 @@ static unordered_set<string> CollectDataFilePaths(const IcebergSnapshot &snapsho
 	return file_paths;
 }
 
+
 // ── Bind data ─────────────────────────────────────────────────────────────────
 
 struct IcebergChangesBindData : public TableFunctionData {
-	vector<pair<string, string>> files; // (file_path, "INSERT" | "DELETE")
-	string iceberg_path;
 	IcebergOptions options;
+
+	// Pre-read rows: all parquet data fetched during Bind using the caller's
+	// ClientContext so Lakekeeper-vended S3 credentials are available.
+	struct FileRows {
+		string change_type;
+		vector<unique_ptr<DataChunk>> chunks;
+	};
+	vector<FileRows> file_rows;
 };
 
 // ── Global state ──────────────────────────────────────────────────────────────
 
 struct IcebergChangesGlobalState : public GlobalTableFunctionState {
-	const vector<pair<string, string>> &files;
 	idx_t file_idx = 0;
-	string current_change_type;
-	unique_ptr<Connection> conn;
-	unique_ptr<QueryResult> current_result;
-	unique_ptr<DataChunk> held_chunk; // keeps fetched parquet chunk alive across Scan calls
+	idx_t chunk_idx = 0;
 	bool done = false;
 
-	explicit IcebergChangesGlobalState(ClientContext &context, const IcebergChangesBindData &bind) : files(bind.files) {
-		auto &db = DatabaseInstance::GetDatabase(context);
-		conn = make_uniq<Connection>(db);
-	}
-
-	bool AdvanceToNextFile() {
-		current_result.reset();
-		while (file_idx < files.size()) {
-			auto &[file_path, change_type] = files[file_idx++];
-			current_change_type = change_type;
-			current_result = conn->Query("SELECT * FROM parquet_scan('" + file_path + "')");
-			if (current_result->HasError()) {
-				current_result.reset();
-				continue;
-			}
-			return true;
-		}
-		done = true;
-		return false;
-	}
+	explicit IcebergChangesGlobalState(bool empty) : done(empty) {}
 };
 
 // ── Bind ──────────────────────────────────────────────────────────────────────
@@ -116,8 +100,7 @@ static unique_ptr<FunctionData> IcebergChangesBind(ClientContext &context, Table
 	auto snap_before_id = input.inputs[1].GetValue<int64_t>();
 	auto snap_after_id = input.inputs[2].GetValue<int64_t>();
 
-	bind_data->iceberg_path = IcebergUtils::GetStorageLocation(context, input_string);
-	auto &iceberg_path = bind_data->iceberg_path;
+	auto iceberg_path = IcebergUtils::GetStorageLocation(context, input_string);
 	auto &fs = FileSystem::GetFileSystem(context);
 
 	// Load table metadata
@@ -146,39 +129,53 @@ static unique_ptr<FunctionData> IcebergChangesBind(ClientContext &context, Table
 	auto after_files =
 	    CollectDataFilePaths(snap_after, after_manifest_list, metadata, context, iceberg_path, bind_data->options);
 
-	// DELETED = in snap_before but not in snap_after (CoW: old files silently dropped)
+	// Build (file_path, change_type) list
+	vector<pair<string, string>> changed_files;
 	for (auto &f : before_files) {
 		if (after_files.find(f) == after_files.end()) {
-			bind_data->files.emplace_back(f, "DELETE");
+			changed_files.emplace_back(f, "DELETE");
 		}
 	}
-	// INSERTED = in snap_after but not in snap_before
 	for (auto &f : after_files) {
 		if (before_files.find(f) == before_files.end()) {
-			bind_data->files.emplace_back(f, "INSERT");
+			changed_files.emplace_back(f, "INSERT");
 		}
 	}
 
-	// Detect output schema from first available parquet file
-	if (!bind_data->files.empty()) {
-		auto &db = DatabaseInstance::GetDatabase(context);
-		auto schema_conn = make_uniq<Connection>(db);
-		auto schema_result =
-		    schema_conn->Query("SELECT * FROM parquet_scan('" + bind_data->files[0].first + "') LIMIT 0");
-		if (!schema_result->HasError()) {
-			names.push_back("_change_type");
-			return_types.push_back(LogicalType::VARCHAR);
-			for (idx_t i = 0; i < schema_result->ColumnCount(); i++) {
-				names.push_back(schema_result->names[i]);
-				return_types.push_back(schema_result->types[i]);
+	// Read all parquet data now using the caller's ClientContext so that
+	// Lakekeeper-vended S3 credentials (connection-scoped) are inherited.
+	// Schema is captured from the first successful read.
+	vector<LogicalType> data_types;
+	vector<string> data_names;
+
+	for (auto &[file_path, change_type] : changed_files) {
+		IcebergChangesBindData::FileRows file_rows_entry;
+		file_rows_entry.change_type = change_type;
+
+		auto result = context.Query("SELECT * FROM parquet_scan('" + file_path + "')", false);
+		if (!result->HasError()) {
+			if (data_types.empty()) {
+				data_types = result->types;
+				data_names = result->names;
 			}
-			return std::move(bind_data);
+			while (true) {
+				auto chunk = result->Fetch();
+				if (!chunk || chunk->size() == 0) {
+					break;
+				}
+				file_rows_entry.chunks.push_back(std::move(chunk));
+			}
 		}
+		bind_data->file_rows.push_back(std::move(file_rows_entry));
 	}
 
-	// Fallback: only _change_type (no diff or unreadable files)
 	names.push_back("_change_type");
 	return_types.push_back(LogicalType::VARCHAR);
+	for (idx_t i = 0; i < data_types.size(); i++) {
+		names.push_back(data_names[i]);
+		return_types.push_back(data_types[i]);
+	}
+
 	return std::move(bind_data);
 }
 
@@ -187,59 +184,50 @@ static unique_ptr<FunctionData> IcebergChangesBind(ClientContext &context, Table
 static unique_ptr<GlobalTableFunctionState> IcebergChangesInitGlobal(ClientContext &context,
                                                                      TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<IcebergChangesBindData>();
-	auto state = make_uniq<IcebergChangesGlobalState>(context, bind);
-	if (!bind.files.empty()) {
-		state->AdvanceToNextFile();
-	} else {
-		state->done = true;
-	}
-	return std::move(state);
+	return make_uniq<IcebergChangesGlobalState>(bind.file_rows.empty());
 }
 
 // ── Scan ──────────────────────────────────────────────────────────────────────
 
 static void IcebergChangesScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<IcebergChangesGlobalState>();
-
-	// Release the previous chunk — output from last call was already processed
-	state.held_chunk.reset();
+	auto &bind = data_p.bind_data->Cast<IcebergChangesBindData>();
 
 	if (state.done) {
 		output.SetCardinality(0);
 		return;
 	}
 
-	while (true) {
-		if (!state.current_result) {
-			output.SetCardinality(0);
-			return;
+	// Advance past exhausted files
+	while (state.file_idx < bind.file_rows.size()) {
+		if (state.chunk_idx < bind.file_rows[state.file_idx].chunks.size()) {
+			break;
 		}
+		state.file_idx++;
+		state.chunk_idx = 0;
+	}
 
-		state.held_chunk = state.current_result->Fetch();
-		if (!state.held_chunk || state.held_chunk->size() == 0) {
-			state.held_chunk.reset();
-			if (!state.AdvanceToNextFile()) {
-				output.SetCardinality(0);
-				return;
-			}
-			continue;
-		}
-
-		idx_t n = state.held_chunk->size();
-		output.SetCardinality(n);
-
-		// Column 0: _change_type — constant per file
-		auto change_type_data = FlatVector::GetData<string_t>(output.data[0]);
-		for (idx_t i = 0; i < n; i++) {
-			change_type_data[i] = StringVector::AddString(output.data[0], state.current_change_type);
-		}
-
-		// Columns 1..N: parquet data columns (reference held_chunk which outlives this call)
-		idx_t data_cols = MinValue<idx_t>(state.held_chunk->ColumnCount(), output.ColumnCount() - 1);
-		for (idx_t i = 0; i < data_cols; i++) {
-			output.data[i + 1].Reference(state.held_chunk->data[i]);
-		}
+	if (state.file_idx >= bind.file_rows.size()) {
+		state.done = true;
+		output.SetCardinality(0);
 		return;
+	}
+
+	auto &file = bind.file_rows[state.file_idx];
+	auto &src = *file.chunks[state.chunk_idx++];
+	idx_t n = src.size();
+	output.SetCardinality(n);
+
+	// Column 0: _change_type — constant per file
+	auto change_type_data = FlatVector::GetData<string_t>(output.data[0]);
+	for (idx_t i = 0; i < n; i++) {
+		change_type_data[i] = StringVector::AddString(output.data[0], file.change_type);
+	}
+
+	// Columns 1..N: copy parquet data columns
+	idx_t data_cols = MinValue<idx_t>(src.ColumnCount(), output.ColumnCount() - 1);
+	for (idx_t i = 0; i < data_cols; i++) {
+		VectorOperations::Copy(src.data[i], output.data[i + 1], n, 0, 0);
 	}
 }
 
