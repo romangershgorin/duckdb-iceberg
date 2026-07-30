@@ -52,6 +52,7 @@ set(EXTENSION_SOURCES
     src/iceberg_functions/iceberg_avro_multi_file_list.cpp
     src/iceberg_functions/iceberg_deletes_file_reader.cpp
     src/iceberg_functions/iceberg_multi_file_list.cpp
+    src/iceberg_functions/iceberg_changes.cpp
     src/iceberg_functions/iceberg_snapshots.cpp
     src/iceberg_functions/iceberg_scan.cpp
     src/iceberg_functions/iceberg_metadata.cpp
