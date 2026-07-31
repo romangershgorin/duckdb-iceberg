@@ -111,8 +111,9 @@ struct IcebergChangesGlobalState : public GlobalTableFunctionState {
 	bool AdvanceToNextFile(const IcebergChangesBindData &bind) {
 		current_result.reset();
 		while (file_idx < bind.files.size()) {
-			auto &[file_path, change_type] = bind.files[file_idx++];
-			current_change_type = change_type;
+			const string &file_path = bind.files[file_idx].first;
+			current_change_type = bind.files[file_idx].second;
+			file_idx++;
 			current_result = conn->Query("SELECT * FROM parquet_scan('" + file_path + "')");
 			if (current_result->HasError()) {
 				current_result.reset();
@@ -192,7 +193,7 @@ static unique_ptr<FunctionData> IcebergChangesBind(ClientContext &context, Table
 		auto &sm = SecretManager::Get(context);
 		auto match = sm.LookupSecret(transaction, bind_data->files[0].first, "s3");
 		if (match.HasMatch()) {
-			auto &kv = match.GetSecret().Cast<KeyValueSecret>();
+			auto &kv = dynamic_cast<const KeyValueSecret &>(match.GetSecret());
 			bind_data->s3_key_id = kv.TryGetValue("key_id").IsNull() ? "" : kv.TryGetValue("key_id").ToString();
 			bind_data->s3_secret = kv.TryGetValue("secret").IsNull() ? "" : kv.TryGetValue("secret").ToString();
 			bind_data->s3_session_token =
