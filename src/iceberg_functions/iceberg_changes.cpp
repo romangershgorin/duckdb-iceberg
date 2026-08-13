@@ -59,11 +59,52 @@ static unordered_set<string> CollectDataFilePaths(const IcebergSnapshot &snapsho
 	return file_paths;
 }
 
+// Builds a DuckDB array literal from a list of S3 paths: ['s3://a', 's3://b']
+static string BuildFileList(const vector<string> &files) {
+	string result = "[";
+	for (idx_t i = 0; i < files.size(); i++) {
+		if (i > 0) {
+			result += ", ";
+		}
+		result += "'" + files[i] + "'";
+	}
+	result += "]";
+	return result;
+}
+
+// Builds the net-diff SQL query over the changed files only.
+//
+// Whole-row IS NOT DISTINCT FROM comparison (keyless, NULL-safe) — equivalent
+// to Spark's create_changelog_view with net_changes=true. Carry-over rows that
+// appear identically in both deleted and inserted files cancel out and are not
+// emitted, giving the correct net INSERT/DELETE set for CDC consumers.
+static string BuildNetDiffQuery(const vector<string> &delete_files, const vector<string> &insert_files) {
+	if (delete_files.empty() && insert_files.empty()) {
+		return "";
+	}
+	if (delete_files.empty()) {
+		return "SELECT 'INSERT' AS _change_type, * FROM parquet_scan(" + BuildFileList(insert_files) + ")";
+	}
+	if (insert_files.empty()) {
+		return "SELECT 'DELETE' AS _change_type, * FROM parquet_scan(" + BuildFileList(delete_files) + ")";
+	}
+	string del_list = BuildFileList(delete_files);
+	string ins_list = BuildFileList(insert_files);
+	return "WITH deleted AS (SELECT * FROM parquet_scan(" + del_list + ")), "
+	       "inserted AS (SELECT * FROM parquet_scan(" + ins_list + ")) "
+	       "SELECT 'DELETE' AS _change_type, d.* FROM deleted d "
+	       "WHERE NOT EXISTS (SELECT 1 FROM inserted i WHERE i IS NOT DISTINCT FROM d) "
+	       "UNION ALL "
+	       "SELECT 'INSERT' AS _change_type, i.* FROM inserted i "
+	       "WHERE NOT EXISTS (SELECT 1 FROM deleted d WHERE d IS NOT DISTINCT FROM i)";
+}
+
 // ── Bind data ─────────────────────────────────────────────────────────────────
 
 struct IcebergChangesBindData : public TableFunctionData {
 	IcebergOptions options;
-	vector<pair<string, string>> files; // (file_path, change_type)
+	vector<string> delete_files;
+	vector<string> insert_files;
 
 	// S3 credentials extracted from the caller's SecretManager so the scan's
 	// internal Connection can inherit them (vended creds are connection-scoped).
@@ -79,14 +120,12 @@ struct IcebergChangesBindData : public TableFunctionData {
 // ── Global state ──────────────────────────────────────────────────────────────
 
 struct IcebergChangesGlobalState : public GlobalTableFunctionState {
-	idx_t file_idx = 0;
-	string current_change_type;
 	unique_ptr<Connection> conn;
 	unique_ptr<QueryResult> current_result;
 	bool done = false;
 
 	explicit IcebergChangesGlobalState(ClientContext &context, const IcebergChangesBindData &bind) {
-		done = bind.files.empty();
+		done = bind.delete_files.empty() && bind.insert_files.empty();
 		if (done) {
 			return;
 		}
@@ -106,23 +145,12 @@ struct IcebergChangesGlobalState : public GlobalTableFunctionState {
 			                         ", REGION '" + bind.s3_region + "'" + endpoint_clause + scope_clause + ")");
 			(void)inject; // ignore errors — worst case falls back to default creds
 		}
-	}
-
-	bool AdvanceToNextFile(const IcebergChangesBindData &bind) {
-		current_result.reset();
-		while (file_idx < bind.files.size()) {
-			const string &file_path = bind.files[file_idx].first;
-			current_change_type = bind.files[file_idx].second;
-			file_idx++;
-			current_result = conn->Query("SELECT * FROM parquet_scan('" + file_path + "')");
-			if (current_result->HasError()) {
-				current_result.reset();
-				continue;
-			}
-			return true;
+		string query = BuildNetDiffQuery(bind.delete_files, bind.insert_files);
+		current_result = conn->Query(query);
+		if (current_result->HasError()) {
+			current_result.reset();
+			done = true;
 		}
-		done = true;
-		return false;
 	}
 };
 
@@ -174,24 +202,30 @@ static unique_ptr<FunctionData> IcebergChangesBind(ClientContext &context, Table
 	auto after_files =
 	    CollectDataFilePaths(snap_after, after_manifest_list, metadata, context, iceberg_path, bind_data->options);
 
-	// Build (file_path, change_type) list
+	// Set-difference: files dropped → delete_files, files added → insert_files
 	for (auto &f : before_files) {
 		if (after_files.find(f) == after_files.end()) {
-			bind_data->files.emplace_back(f, "DELETE");
+			bind_data->delete_files.push_back(f);
 		}
 	}
 	for (auto &f : after_files) {
 		if (before_files.find(f) == before_files.end()) {
-			bind_data->files.emplace_back(f, "INSERT");
+			bind_data->insert_files.push_back(f);
 		}
 	}
 
 	// Extract S3 credentials from the caller's secret manager so the scan's
 	// internal Connection can be seeded with them (they're connection-scoped).
-	if (!bind_data->files.empty()) {
+	string first_file;
+	if (!bind_data->delete_files.empty()) {
+		first_file = bind_data->delete_files[0];
+	} else if (!bind_data->insert_files.empty()) {
+		first_file = bind_data->insert_files[0];
+	}
+	if (!first_file.empty()) {
 		auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
 		auto &sm = SecretManager::Get(context);
-		auto match = sm.LookupSecret(transaction, bind_data->files[0].first, "s3");
+		auto match = sm.LookupSecret(transaction, first_file, "s3");
 		if (match.HasMatch()) {
 			auto &kv = dynamic_cast<const KeyValueSecret &>(match.GetSecret());
 			bind_data->s3_key_id = kv.TryGetValue("key_id").IsNull() ? "" : kv.TryGetValue("key_id").ToString();
@@ -233,42 +267,26 @@ static unique_ptr<GlobalTableFunctionState> IcebergChangesInitGlobal(ClientConte
 
 static void IcebergChangesScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<IcebergChangesGlobalState>();
-	auto &bind = data_p.bind_data->Cast<IcebergChangesBindData>();
 
-	while (true) {
-		if (state.done) {
-			output.SetCardinality(0);
-			return;
-		}
-
-		if (!state.current_result) {
-			if (!state.AdvanceToNextFile(bind)) {
-				output.SetCardinality(0);
-				return;
-			}
-		}
-
-		auto chunk = state.current_result->Fetch();
-		if (!chunk || chunk->size() == 0) {
-			state.current_result.reset();
-			continue; // try next file
-		}
-
-		idx_t n = chunk->size();
-		output.SetCardinality(n);
-
-		// Column 0: _change_type — constant per file
-		auto change_type_data = FlatVector::GetData<string_t>(output.data[0]);
-		for (idx_t i = 0; i < n; i++) {
-			change_type_data[i] = StringVector::AddString(output.data[0], state.current_change_type);
-		}
-
-		// Columns 1..N: data columns from parquet
-		idx_t data_cols = MinValue<idx_t>(chunk->ColumnCount(), output.ColumnCount() - 1);
-		for (idx_t i = 0; i < data_cols; i++) {
-			VectorOperations::Copy(chunk->data[i], output.data[i + 1], n, 0, 0);
-		}
+	if (state.done || !state.current_result) {
+		output.SetCardinality(0);
 		return;
+	}
+
+	auto chunk = state.current_result->Fetch();
+	if (!chunk || chunk->size() == 0) {
+		output.SetCardinality(0);
+		state.done = true;
+		return;
+	}
+
+	idx_t n = chunk->size();
+	output.SetCardinality(n);
+
+	// All columns (including _change_type at index 0) come from the net-diff query result.
+	idx_t col_count = MinValue<idx_t>(chunk->ColumnCount(), output.ColumnCount());
+	for (idx_t i = 0; i < col_count; i++) {
+		VectorOperations::Copy(chunk->data[i], output.data[i], n, 0, 0);
 	}
 }
 
