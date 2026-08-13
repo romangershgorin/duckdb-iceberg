@@ -243,7 +243,20 @@ static unique_ptr<FunctionData> IcebergChangesBind(ClientContext &context, Table
 	auto iceberg_path = IcebergUtils::GetStorageLocation(context, input_string);
 	auto &fs = FileSystem::GetFileSystem(context);
 
-	// Load table metadata
+	// When resolving a catalog reference, GetStorageLocation returns the metadata
+	// file path (s3://.../metadata/00240-....json), not the table root. Path
+	// construction in LoadManifestList (allow_moved_paths mode) requires the table
+	// root. Strip the /metadata/... suffix to recover it.
+	string table_root = iceberg_path;
+	if (StringUtil::EndsWith(table_root, ".json")) {
+		auto lpath = StringUtil::Lower(table_root);
+		auto found = lpath.rfind("/metadata/");
+		if (found != string::npos) {
+			table_root = table_root.substr(0, found);
+		}
+	}
+
+	// Load table metadata (iceberg_path may already be a metadata JSON path)
 	auto meta_path = IcebergTableMetadata::GetMetaDataPath(context, iceberg_path, fs, bind_data->options);
 	auto table_metadata_raw = IcebergTableMetadata::Parse(meta_path, fs, bind_data->options.metadata_compression_codec);
 	auto metadata = IcebergTableMetadata::FromTableMetadata(table_metadata_raw);
@@ -260,14 +273,14 @@ static unique_ptr<FunctionData> IcebergChangesBind(ClientContext &context, Table
 	const IcebergSnapshot &snap_before = *snap_before_ptr;
 	const IcebergSnapshot &snap_after = *snap_after_ptr;
 
-	// Load manifest lists and diff data file sets
-	auto before_manifest_list = LoadManifestList(snap_before, metadata, context, iceberg_path, bind_data->options);
-	auto after_manifest_list = LoadManifestList(snap_after, metadata, context, iceberg_path, bind_data->options);
+	// Load manifest lists and diff data file sets using table_root for path construction
+	auto before_manifest_list = LoadManifestList(snap_before, metadata, context, table_root, bind_data->options);
+	auto after_manifest_list = LoadManifestList(snap_after, metadata, context, table_root, bind_data->options);
 
 	auto before_files =
-	    CollectDataFilePaths(snap_before, before_manifest_list, metadata, context, iceberg_path, bind_data->options);
+	    CollectDataFilePaths(snap_before, before_manifest_list, metadata, context, table_root, bind_data->options);
 	auto after_files =
-	    CollectDataFilePaths(snap_after, after_manifest_list, metadata, context, iceberg_path, bind_data->options);
+	    CollectDataFilePaths(snap_after, after_manifest_list, metadata, context, table_root, bind_data->options);
 
 	// Set-difference: files dropped → delete_files, files added → insert_files
 	for (auto &f : before_files) {
