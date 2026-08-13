@@ -72,13 +72,28 @@ static string BuildFileList(const vector<string> &files) {
 	return result;
 }
 
+// Builds "left.col1 = right.col1 AND left.col2 = right.col2 ..." for a JOIN/EXISTS clause.
+static string BuildJoinCondition(const vector<string> &cols, const string &left, const string &right) {
+	string result;
+	for (idx_t i = 0; i < cols.size(); i++) {
+		if (i > 0) {
+			result += " AND ";
+		}
+		result += left + "." + cols[i] + " = " + right + "." + cols[i];
+	}
+	return result;
+}
+
 // Builds the net-diff SQL query over the changed files only.
 //
-// Whole-row IS NOT DISTINCT FROM comparison (keyless, NULL-safe) — equivalent
-// to Spark's create_changelog_view with net_changes=true. Carry-over rows that
-// appear identically in both deleted and inserted files cancel out and are not
-// emitted, giving the correct net INSERT/DELETE set for CDC consumers.
-static string BuildNetDiffQuery(const vector<string> &delete_files, const vector<string> &insert_files) {
+// Without identifier_columns (keyless): whole-row IS NOT DISTINCT FROM comparison,
+// equivalent to Spark's create_changelog_view with net_changes=true. Carry-over rows
+// that appear identically in both deleted and inserted files cancel out.
+//
+// With identifier_columns: pairs DELETE+INSERT rows that share the same key into
+// UPDATE_BEFORE/UPDATE_AFTER. Unmatched DELETEs/INSERTs are emitted as-is.
+static string BuildNetDiffQuery(const vector<string> &delete_files, const vector<string> &insert_files,
+                                const vector<string> &identifier_columns) {
 	if (delete_files.empty() && insert_files.empty()) {
 		return "";
 	}
@@ -90,13 +105,40 @@ static string BuildNetDiffQuery(const vector<string> &delete_files, const vector
 	}
 	string del_list = BuildFileList(delete_files);
 	string ins_list = BuildFileList(insert_files);
+
+	if (identifier_columns.empty()) {
+		// Keyless whole-row net-diff
+		return "WITH deleted AS (SELECT * FROM parquet_scan(" + del_list + ")), "
+		       "inserted AS (SELECT * FROM parquet_scan(" + ins_list + ")) "
+		       "SELECT 'DELETE' AS _change_type, d.* FROM deleted d "
+		       "WHERE NOT EXISTS (SELECT 1 FROM inserted i WHERE i IS NOT DISTINCT FROM d) "
+		       "UNION ALL "
+		       "SELECT 'INSERT' AS _change_type, i.* FROM inserted i "
+		       "WHERE NOT EXISTS (SELECT 1 FROM deleted d WHERE d IS NOT DISTINCT FROM i)";
+	}
+
+	// Keyed net-diff: pairs UPDATE_BEFORE/UPDATE_AFTER by identifier_columns
+	string jdi = BuildJoinCondition(identifier_columns, "d", "i");
+	string jid = BuildJoinCondition(identifier_columns, "i", "d");
 	return "WITH deleted AS (SELECT * FROM parquet_scan(" + del_list + ")), "
-	       "inserted AS (SELECT * FROM parquet_scan(" + ins_list + ")) "
-	       "SELECT 'DELETE' AS _change_type, d.* FROM deleted d "
-	       "WHERE NOT EXISTS (SELECT 1 FROM inserted i WHERE i IS NOT DISTINCT FROM d) "
+	       "inserted AS (SELECT * FROM parquet_scan(" + ins_list + ")), "
+	       "net_deletes AS ("
+	       "  SELECT d.* FROM deleted d "
+	       "  WHERE NOT EXISTS (SELECT 1 FROM inserted i WHERE i IS NOT DISTINCT FROM d)), "
+	       "net_inserts AS ("
+	       "  SELECT i.* FROM inserted i "
+	       "  WHERE NOT EXISTS (SELECT 1 FROM deleted d WHERE d IS NOT DISTINCT FROM i)) "
+	       "SELECT 'UPDATE_BEFORE' AS _change_type, d.* FROM net_deletes d "
+	       "  INNER JOIN net_inserts i ON " + jdi + " "
 	       "UNION ALL "
-	       "SELECT 'INSERT' AS _change_type, i.* FROM inserted i "
-	       "WHERE NOT EXISTS (SELECT 1 FROM deleted d WHERE d IS NOT DISTINCT FROM i)";
+	       "SELECT 'UPDATE_AFTER' AS _change_type, i.* FROM net_inserts i "
+	       "  INNER JOIN net_deletes d ON " + jid + " "
+	       "UNION ALL "
+	       "SELECT 'DELETE' AS _change_type, d.* FROM net_deletes d "
+	       "  WHERE NOT EXISTS (SELECT 1 FROM net_inserts i WHERE " + jdi + ") "
+	       "UNION ALL "
+	       "SELECT 'INSERT' AS _change_type, i.* FROM net_inserts i "
+	       "  WHERE NOT EXISTS (SELECT 1 FROM net_deletes d WHERE " + jid + ")";
 }
 
 // ── Bind data ─────────────────────────────────────────────────────────────────
@@ -105,6 +147,7 @@ struct IcebergChangesBindData : public TableFunctionData {
 	IcebergOptions options;
 	vector<string> delete_files;
 	vector<string> insert_files;
+	vector<string> identifier_columns;
 
 	// S3 credentials extracted from the caller's SecretManager so the scan's
 	// internal Connection can inherit them (vended creds are connection-scoped).
@@ -145,7 +188,7 @@ struct IcebergChangesGlobalState : public GlobalTableFunctionState {
 			                         ", REGION '" + bind.s3_region + "'" + endpoint_clause + scope_clause + ")");
 			(void)inject; // ignore errors — worst case falls back to default creds
 		}
-		string query = BuildNetDiffQuery(bind.delete_files, bind.insert_files);
+		string query = BuildNetDiffQuery(bind.delete_files, bind.insert_files, bind.identifier_columns);
 		current_result = conn->Query(query);
 		if (current_result->HasError()) {
 			current_result.reset();
@@ -166,6 +209,10 @@ static unique_ptr<FunctionData> IcebergChangesBind(ClientContext &context, Table
 			bind_data->options.allow_moved_paths = BooleanValue::Get(kv.second);
 		} else if (loption == "metadata_compression_codec") {
 			bind_data->options.metadata_compression_codec = StringValue::Get(kv.second);
+		} else if (loption == "identifier_columns") {
+			for (auto &child : ListValue::GetChildren(kv.second)) {
+				bind_data->identifier_columns.push_back(StringValue::Get(child));
+			}
 		}
 	}
 
@@ -298,6 +345,7 @@ TableFunctionSet IcebergFunctions::GetIcebergChangesFunction() {
 	                             IcebergChangesBind, IcebergChangesInitGlobal);
 	table_function.named_parameters["allow_moved_paths"] = LogicalType::BOOLEAN;
 	table_function.named_parameters["metadata_compression_codec"] = LogicalType::VARCHAR;
+	table_function.named_parameters["identifier_columns"] = LogicalType::LIST(LogicalType::VARCHAR);
 	function_set.AddFunction(table_function);
 	return function_set;
 }
